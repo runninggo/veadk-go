@@ -120,9 +120,19 @@ opentelemetry:
 func TestObservabilityConfig_EnvMapping(t *testing.T) {
 	os.Setenv("OBSERVABILITY_OPENTELEMETRY_APMPLUS_ENDPOINT", "http://env-endpoint")
 	os.Setenv("OBSERVABILITY_OPENTELEMETRY_ENABLE_GLOBAL_PROVIDER", "true")
+	os.Setenv("OBSERVABILITY_OPENTELEMETRY_TLS_PROJECT_NAME", "tls-project")
+	os.Setenv("OBSERVABILITY_OPENTELEMETRY_TLS_TRACE_INSTANCE_NAME", "tls-trace")
+	os.Setenv("OBSERVABILITY_OPENTELEMETRY_TLS_API_ENDPOINT", "https://tls-cn-beijing.volces.com")
+	os.Setenv("OBSERVABILITY_OPENTELEMETRY_TLS_AUTO_CREATE", "false")
+	os.Setenv("OBSERVABILITY_OPENTELEMETRY_TLS_SESSION_TOKEN", "tls-token")
 	defer func() {
 		os.Unsetenv("OBSERVABILITY_OPENTELEMETRY_APMPLUS_ENDPOINT")
 		os.Unsetenv("OBSERVABILITY_OPENTELEMETRY_ENABLE_GLOBAL_PROVIDER")
+		os.Unsetenv("OBSERVABILITY_OPENTELEMETRY_TLS_PROJECT_NAME")
+		os.Unsetenv("OBSERVABILITY_OPENTELEMETRY_TLS_TRACE_INSTANCE_NAME")
+		os.Unsetenv("OBSERVABILITY_OPENTELEMETRY_TLS_API_ENDPOINT")
+		os.Unsetenv("OBSERVABILITY_OPENTELEMETRY_TLS_AUTO_CREATE")
+		os.Unsetenv("OBSERVABILITY_OPENTELEMETRY_TLS_SESSION_TOKEN")
 	}()
 
 	config := &ObservabilityConfig{}
@@ -132,6 +142,13 @@ func TestObservabilityConfig_EnvMapping(t *testing.T) {
 	assert.NotNil(t, config.OpenTelemetry.ApmPlus)
 	assert.Equal(t, "http://env-endpoint", config.OpenTelemetry.ApmPlus.Endpoint)
 	assert.True(t, config.OpenTelemetry.EnableGlobalProvider)
+	assert.NotNil(t, config.OpenTelemetry.TLS)
+	assert.Equal(t, "tls-project", config.OpenTelemetry.TLS.ProjectName)
+	assert.Equal(t, "tls-trace", config.OpenTelemetry.TLS.TraceInstanceName)
+	assert.Equal(t, "https://tls-cn-beijing.volces.com", config.OpenTelemetry.TLS.APIEndpoint)
+	assert.Equal(t, "tls-token", config.OpenTelemetry.TLS.SessionToken)
+	assert.NotNil(t, config.OpenTelemetry.TLS.AutoCreate)
+	assert.False(t, *config.OpenTelemetry.TLS.AutoCreate)
 }
 
 func TestObservabilityConfig_Priority(t *testing.T) {

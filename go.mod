@@ -13,6 +13,7 @@ require (
 	github.com/modelcontextprotocol/go-sdk v0.7.0
 	github.com/stretchr/testify v1.11.1
 	github.com/volcengine/ve-tos-golang-sdk/v2 v2.7.26
+	github.com/volcengine/volc-sdk-golang v1.0.23
 	github.com/volcengine/volcengine-go-sdk v1.1.53
 	go.opentelemetry.io/otel v1.39.0
 	go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc v0.15.0
@@ -86,7 +87,6 @@ require (
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
 	github.com/valyala/fasttemplate v1.2.2 // indirect
-	github.com/volcengine/volc-sdk-golang v1.0.23 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.mongodb.org/mongo-driver v1.17.6 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
