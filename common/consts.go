@@ -149,6 +149,12 @@ const (
 	COZELOOP_API_TOKEN    = "COZELOOP_API_TOKEN"
 )
 
+// LAS
+const (
+	TOOL_LAS_URL     = "TOOL_LAS_URL"
+	TOOL_LAS_API_KEY = "TOOL_LAS_API_KEY"
+)
+
 // VeSpeech (TTS)
 const (
 	TOOL_VESPEECH_APP_ID            = "TOOL_VESPEECH_APP_ID"
