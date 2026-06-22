@@ -18,11 +18,13 @@ import (
 	"context"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/volcengine/veadk-go/configs"
 	"github.com/volcengine/veadk-go/log"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/adk/agent"
 	"google.golang.org/adk/model"
@@ -57,15 +59,16 @@ func NewPlugin(opts ...Option) *plugin.Plugin {
 
 	// no need to check the error as it is always nil.
 	pluginInstance, _ := plugin.New(plugin.Config{
-		Name:                PluginName,
-		BeforeRunCallback:   p.BeforeRun,
-		AfterRunCallback:    p.AfterRun,
-		BeforeAgentCallback: p.BeforeAgent,
-		AfterAgentCallback:  p.AfterAgent,
-		BeforeModelCallback: p.BeforeModel,
-		AfterModelCallback:  p.AfterModel,
-		BeforeToolCallback:  p.BeforeTool,
-		AfterToolCallback:   p.AfterTool,
+		Name:                 PluginName,
+		BeforeRunCallback:    p.BeforeRun,
+		AfterRunCallback:     p.AfterRun,
+		BeforeAgentCallback:  p.BeforeAgent,
+		AfterAgentCallback:   p.AfterAgent,
+		BeforeModelCallback:  p.BeforeModel,
+		AfterModelCallback:   p.AfterModel,
+		OnModelErrorCallback: p.OnModelError,
+		BeforeToolCallback:   p.BeforeTool,
+		AfterToolCallback:    p.AfterTool,
 	})
 	return pluginInstance
 }
@@ -108,8 +111,9 @@ func (p *adkObservabilityPlugin) BeforeRun(ctx agent.InvocationContext) (*genai.
 	log.Debug("Before Run", "InvocationID", ctx.InvocationID(), "SessionID", ctx.Session().ID(), "UserID", ctx.Session().UserID())
 	// 1. Start the 'invocation' span - ADK doesn't create this yet
 	// (e.g. spans from HTTP middleware will be the parent)
-	_, span := p.tracer.Start(context.Context(ctx), SpanInvocation, trace.WithSpanKind(trace.SpanKindServer))
+	newCtx, span := p.tracer.Start(context.Context(ctx), SpanInvocation, trace.WithSpanKind(trace.SpanKindInternal))
 	_ = ctx.Session().State().Set(stateKeyInvocationSpan, span)
+	_ = ctx.Session().State().Set(stateKeyInvocationCtx, newCtx)
 	GetRegistry().RegisterInvocationSpan(span)
 
 	setCommonAttributesFromInvocation(ctx, span)
@@ -117,9 +121,12 @@ func (p *adkObservabilityPlugin) BeforeRun(ctx agent.InvocationContext) (*genai.
 
 	// 2. Link the adk trace ID to our invocation span
 	// This makes invoke_agent span's parent point to our invocation span
+	ownerTraceID := span.SpanContext().TraceID()
 	if adkSpan := trace.SpanFromContext(context.Context(ctx)); adkSpan.SpanContext().IsValid() {
+		ownerTraceID = adkSpan.SpanContext().TraceID()
 		GetRegistry().RegisterInvocationSpanContext(adkSpan.SpanContext().TraceID(), span.SpanContext())
 	}
+	_ = ctx.Session().State().Set(stateKeyOwnerTraceID, ownerTraceID)
 	// Record start time for metrics
 	meta := &spanMetadata{
 		StartTime: time.Now(),
@@ -148,6 +155,7 @@ func (p *adkObservabilityPlugin) BeforeRun(ctx agent.InvocationContext) (*genai.
 // AfterRun is called after an agent run ends.
 func (p *adkObservabilityPlugin) AfterRun(ctx agent.InvocationContext) {
 	log.Debug("After Run", "InvocationID", ctx.InvocationID(), "SessionID", ctx.Session().ID(), "UserID", ctx.Session().UserID())
+	p.finishDanglingModelSpan(ctx)
 	// 1. End the span
 	s, _ := ctx.Session().State().Get(stateKeyInvocationSpan)
 	if s == nil {
@@ -222,12 +230,8 @@ func (p *adkObservabilityPlugin) AfterRun(ctx agent.InvocationContext) {
 
 		// Clean up from global map with delay to allow children to be exported.
 		// Since we have multiple exporters, we wait long enough for all of them to finish.
-		adkSpan := trace.SpanFromContext(context.Context(ctx))
-		if adkSpan.SpanContext().IsValid() {
-			tid := adkSpan.SpanContext().TraceID()
-			veadkInvocationSpanID := span.SpanContext().SpanID()
-			GetRegistry().ScheduleCleanup(tid, veadkInvocationSpanID)
-		}
+		ownerTraceID := traceIDFromState(ctx.Session().State(), stateKeyOwnerTraceID, span.SpanContext().TraceID())
+		GetRegistry().ScheduleCleanup(ownerTraceID, span.SpanContext().SpanID())
 
 		span.End()
 	}
@@ -240,6 +244,19 @@ func (p *adkObservabilityPlugin) BeforeAgent(ctx agent.CallbackContext) (*genai.
 	log.Debug("BeforeAgent",
 		"InvocationID", ctx.InvocationID(), "SessionID", ctx.SessionID(), "UserID", ctx.UserID(), "AgentName", ctx.AgentName(), "AppName", ctx.AppName())
 	p.tryBridgeTraceMappingFromCallback(ctx, "BeforeAgent")
+	currentCtx := context.Context(ctx)
+	currentSpan := trace.SpanFromContext(currentCtx)
+	if currentSpan.SpanContext().IsValid() {
+		_ = ctx.State().Set(stateKeyInvokeAgentCtx, currentCtx)
+		if currentSpan.IsRecording() {
+			setCommonAttributesFromCallback(ctx, currentSpan)
+			setAgentAttributes(currentSpan, ctx.AgentName())
+		}
+		return nil, nil
+	}
+	if ictx, _ := ctx.State().Get(stateKeyInvocationCtx); ictx != nil {
+		_ = ctx.State().Set(stateKeyInvokeAgentCtx, ictx)
+	}
 	return nil, nil
 }
 
@@ -264,6 +281,7 @@ func (p *adkObservabilityPlugin) tryBridgeTraceMappingFromCallback(ctx agent.Cal
 func (p *adkObservabilityPlugin) AfterAgent(ctx agent.CallbackContext) (*genai.Content, error) {
 	log.Debug("AfterAgent",
 		"InvocationID", ctx.InvocationID(), "SessionID", ctx.SessionID(), "UserID", ctx.UserID(), "AgentName", ctx.AgentName(), "AppName", ctx.AppName())
+	_ = ctx.State().Set(stateKeyInvokeAgentCtx, nil)
 	return nil, nil
 }
 
@@ -272,13 +290,37 @@ func (p *adkObservabilityPlugin) BeforeModel(ctx agent.CallbackContext, req *mod
 	log.Debug("BeforeModel",
 		"InvocationID", ctx.InvocationID(), "SessionID", ctx.SessionID(), "UserID", ctx.UserID(), "AgentName", ctx.AgentName(), "AppName", ctx.AppName())
 	p.tryBridgeTraceMappingFromCallback(ctx, "BeforeModel")
-	// ADK now emits model spans natively. Plugin only keeps metadata for metrics and invocation aggregation.
+	_ = ctx.State().Set(stateKeyStreamingOutput, nil)
+
+	parentCtx := context.Context(ctx)
+	if actx, _ := ctx.State().Get(stateKeyInvokeAgentCtx); actx != nil {
+		if parent, ok := actx.(context.Context); ok && parent != nil {
+			parentCtx = parent
+		}
+	} else if ictx, _ := ctx.State().Get(stateKeyInvocationCtx); ictx != nil {
+		if parent, ok := ictx.(context.Context); ok && parent != nil {
+			parentCtx = parent
+		}
+	}
+	llmSpanStartedAt := time.Now()
+	_, span := p.tracer.Start(parentCtx, SpanCallLLM, trace.WithSpanKind(trace.SpanKindInternal))
+	_ = ctx.State().Set(stateKeyStreamingSpan, span)
+	setCommonAttributesFromCallback(ctx, span)
+	setLLMAttributes(span)
+	if req != nil && req.Model != "" {
+		span.SetAttributes(attribute.String(AttrGenAIRequestModel, req.Model))
+	}
+	ownerTraceID := traceIDFromState(ctx.State(), stateKeyOwnerTraceID, span.SpanContext().TraceID())
+	GetRegistry().RegisterManagedLLMSpan(ownerTraceID, span.SpanContext(), llmSpanStartedAt)
+
 	meta := p.getSpanMetadata(ctx.State())
-	meta.StartTime = time.Now()
+	meta.StartTime = llmSpanStartedAt
 	meta.PrevPromptTokens = meta.PromptTokens
 	meta.PrevCandidateTokens = meta.CandidateTokens
 	meta.PrevTotalTokens = meta.TotalTokens
-	meta.ModelName = req.Model
+	if req != nil {
+		meta.ModelName = req.Model
+	}
 	p.storeSpanMetadata(ctx.State(), meta)
 	return nil, nil
 }
@@ -287,6 +329,10 @@ func (p *adkObservabilityPlugin) BeforeModel(ctx agent.CallbackContext, req *mod
 func (p *adkObservabilityPlugin) AfterModel(ctx agent.CallbackContext, resp *model.LLMResponse, err error) (*model.LLMResponse, error) {
 	log.Debug("AfterModel",
 		"InvocationID", ctx.InvocationID(), "SessionID", ctx.SessionID(), "UserID", ctx.UserID(), "AgentName", ctx.AgentName(), "AppName", ctx.AppName())
+	span, ok := streamingSpanFromState(ctx, "AfterModel")
+	if !ok {
+		return nil, nil
+	}
 	meta := p.getSpanMetadata(ctx.State())
 
 	if err != nil {
@@ -300,6 +346,7 @@ func (p *adkObservabilityPlugin) AfterModel(ctx agent.CallbackContext, resp *mod
 			}
 			RecordExceptions(context.Context(ctx), 1, metricAttrs...)
 		}
+		p.finishModelErrorSpan(ctx, span, err)
 		return nil, nil
 	}
 
@@ -315,7 +362,16 @@ func (p *adkObservabilityPlugin) AfterModel(ctx agent.CallbackContext, resp *mod
 	}
 
 	if resp.UsageMetadata != nil {
+		if attrs := llmUsageAttributes(resp.UsageMetadata); len(attrs) > 0 {
+			span.SetAttributes(attrs...)
+		}
 		p.accumulateLLMUsageAndRecordMetrics(ctx, resp, finalModelName)
+	}
+	if resp.Partial {
+		span.SetAttributes(attribute.Bool(AttrGenAIIsStreaming, true))
+	}
+	if finalModelName != "" {
+		span.SetAttributes(attribute.String(AttrGenAIResponseModel, finalModelName))
 	}
 
 	if resp.Content != nil {
@@ -323,25 +379,36 @@ func (p *adkObservabilityPlugin) AfterModel(ctx agent.CallbackContext, resp *mod
 			_ = ctx.State().Set(stateKeyStreamingOutput, resp.Content)
 		}
 
-		parentSC, _ := getInvocationSpanContextFromState(ctx.State())
-
-		adkSpan := trace.SpanFromContext(context.Context(ctx))
-		adkTraceID := trace.TraceID{}
-		if adkSpan.SpanContext().IsValid() {
-			adkTraceID = adkSpan.SpanContext().TraceID()
-		}
-
+		ownerTraceID := traceIDFromState(ctx.State(), stateKeyOwnerTraceID, span.SpanContext().TraceID())
 		for _, part := range resp.Content.Parts {
-			if part.FunctionCall != nil && part.FunctionCall.ID != "" && parentSC.IsValid() {
-				GetRegistry().RegisterToolCallMapping(part.FunctionCall.ID, adkTraceID, parentSC)
+			if part != nil && part.FunctionCall != nil {
+				toolCallID := ensureFunctionCallID(part.FunctionCall)
+				GetRegistry().RegisterToolCallMapping(toolCallID, ownerTraceID, span.SpanContext())
 			}
 		}
 	}
 
 	if !resp.Partial {
 		p.recordFinalResponseMetrics(ctx, meta, finalModelName)
+		finishManagedLLMSpanWindow(ctx.State(), span)
+		span.End()
 	}
 
+	return nil, nil
+}
+
+// OnModelError is called when the model iterator yields an error before a normal
+// response can be processed. This closes the managed call_llm span for failures
+// where AfterModel would otherwise not run.
+func (p *adkObservabilityPlugin) OnModelError(ctx agent.CallbackContext, _ *model.LLMRequest, err error) (*model.LLMResponse, error) {
+	if err == nil {
+		return nil, nil
+	}
+	span, ok := streamingSpanFromState(ctx, "OnModelError")
+	if !ok {
+		return nil, nil
+	}
+	p.finishModelErrorSpan(ctx, span, err)
 	return nil, nil
 }
 
@@ -396,6 +463,38 @@ func (p *adkObservabilityPlugin) accumulateLLMUsageAndRecordMetrics(ctx agent.Ca
 	}
 }
 
+func llmUsageAttributes(usage *genai.GenerateContentResponseUsageMetadata) []attribute.KeyValue {
+	if usage == nil {
+		return nil
+	}
+
+	currentPrompt := int64(usage.PromptTokenCount)
+	currentCandidate := int64(usage.CandidatesTokenCount)
+	currentTotal := int64(usage.TotalTokenCount)
+	if currentTotal == 0 && (currentPrompt > 0 || currentCandidate > 0) {
+		currentTotal = currentPrompt + currentCandidate
+	}
+
+	attrs := make([]attribute.KeyValue, 0, 5)
+	if currentPrompt > 0 {
+		attrs = append(attrs, attribute.Int64(AttrGenAIUsageInputTokens, currentPrompt))
+	}
+	if currentCandidate > 0 {
+		attrs = append(attrs, attribute.Int64(AttrGenAIUsageOutputTokens, currentCandidate))
+	}
+	if currentTotal > 0 {
+		attrs = append(attrs, attribute.Int64(AttrGenAIUsageTotalTokens, currentTotal))
+	}
+	if usage.CachedContentTokenCount > 0 {
+		cached := int64(usage.CachedContentTokenCount)
+		attrs = append(attrs,
+			attribute.Int64(AttrGenAIUsageCacheCreationInputTokens, cached),
+			attribute.Int64(AttrGenAIUsageCacheReadInputTokens, cached),
+		)
+	}
+	return attrs
+}
+
 func mergeUsageTotals(prevPrompt, prevCandidate, prevTotal, currentPrompt, currentCandidate, currentTotal int64) (int64, int64, int64) {
 	if currentTotal == 0 && (currentPrompt > 0 || currentCandidate > 0) {
 		currentTotal = currentPrompt + currentCandidate
@@ -439,6 +538,75 @@ func (p *adkObservabilityPlugin) storeSpanMetadata(state session.State, meta *sp
 	_ = state.Set(stateKeyMetadata, meta)
 }
 
+func traceIDFromState(state session.State, key string, fallback trace.TraceID) trace.TraceID {
+	if state == nil {
+		return fallback
+	}
+	val, _ := state.Get(key)
+	if tid, ok := val.(trace.TraceID); ok && tid.IsValid() {
+		return tid
+	}
+	return fallback
+}
+
+func finishManagedLLMSpanWindow(state session.State, span trace.Span) {
+	if state == nil || span == nil {
+		return
+	}
+	ownerTraceID := traceIDFromState(state, stateKeyOwnerTraceID, span.SpanContext().TraceID())
+	GetRegistry().FinishManagedLLMSpan(ownerTraceID, span.SpanContext().SpanID(), time.Now())
+}
+
+func ensureFunctionCallID(call *genai.FunctionCall) string {
+	if call == nil {
+		return ""
+	}
+	if call.ID == "" {
+		call.ID = "adk-" + uuid.NewString()
+	}
+	return call.ID
+}
+
+func streamingSpanFromState(ctx agent.CallbackContext, callbackName string) (trace.Span, bool) {
+	s, _ := ctx.State().Get(stateKeyStreamingSpan)
+	if s == nil {
+		log.Warn(callbackName + ": no streaming span found in state")
+		return nil, false
+	}
+	span, ok := s.(trace.Span)
+	if !ok {
+		log.Warn(callbackName + ": streaming span has unexpected type")
+		return nil, false
+	}
+	return span, true
+}
+
+func (p *adkObservabilityPlugin) finishModelErrorSpan(ctx agent.CallbackContext, span trace.Span, err error) {
+	if err == nil || span == nil {
+		return
+	}
+	span.SetStatus(codes.Error, err.Error())
+	if span.IsRecording() {
+		finishManagedLLMSpanWindow(ctx.State(), span)
+		span.End()
+	}
+}
+
+func (p *adkObservabilityPlugin) finishDanglingModelSpan(ctx agent.InvocationContext) {
+	s, _ := ctx.Session().State().Get(stateKeyStreamingSpan)
+	if s == nil {
+		return
+	}
+	span, ok := s.(trace.Span)
+	if !ok || !span.IsRecording() {
+		return
+	}
+	err := context.Canceled
+	span.SetStatus(codes.Error, err.Error())
+	finishManagedLLMSpanWindow(ctx.Session().State(), span)
+	span.End()
+}
+
 func registerTraceMappingIfPossible(registry *TraceRegistry, adkSC, veadkSC trace.SpanContext) bool {
 	if registry == nil || !adkSC.IsValid() || !veadkSC.IsValid() {
 		return false
@@ -461,9 +629,13 @@ func getInvocationSpanContextFromState(state session.State) (trace.SpanContext, 
 
 const (
 	stateKeyInvocationSpan = "veadk.observability.invocation_span"
+	stateKeyInvocationCtx  = "veadk.observability.invocation_ctx"
+	stateKeyInvokeAgentCtx = "veadk.observability.invoke_agent_ctx"
+	stateKeyOwnerTraceID   = "veadk.observability.owner_trace_id"
 
 	stateKeyMetadata        = "veadk.observability.metadata"
 	stateKeyStreamingOutput = "veadk.observability.streaming_output"
+	stateKeyStreamingSpan   = "veadk.observability.streaming_span"
 )
 
 // spanMetadata groups various observational data points in a single structure

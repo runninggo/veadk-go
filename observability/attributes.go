@@ -47,6 +47,20 @@ func setCommonAttributesFromInvocation(ctx agent.InvocationContext, span trace.S
 	)
 }
 
+// setCommonAttributesFromCallback enriches a span with identity attributes that
+// are available from an ADK callback context, including the current agent name.
+func setCommonAttributesFromCallback(ctx agent.CallbackContext, span trace.Span) {
+	setCommonAttributesWithIdentity(
+		context.Context(ctx),
+		span,
+		ctx.SessionID(),
+		ctx.UserID(),
+		ctx.AppName(),
+		ctx.InvocationID(),
+	)
+	setDynamicAttribute(span, AttrGenAIAgentName, ctx.AgentName(), FallbackAgentName, AttrAgentName, AttrAgentNameDot)
+}
+
 func setCommonAttributesWithIdentity(ctx context.Context, span trace.Span, sessionID, userID, appName, invocationID string) {
 	// 1. Fixed attributes
 	span.SetAttributes(attribute.String(AttrCozeloopReportSource, DefaultCozeLoopReportSource))
@@ -80,6 +94,24 @@ func setWorkflowAttributes(span trace.Span) {
 	span.SetAttributes(
 		attribute.String(AttrGenAISpanKind, SpanKindWorkflow),
 		attribute.String(AttrGenAIOperationName, OperationNameChain),
+	)
+}
+
+// setAgentAttributes sets standard GenAI attributes for agent spans.
+func setAgentAttributes(span trace.Span, name string) {
+	setDynamicAttribute(span, AttrGenAIAgentName, name, FallbackAgentName, AttrAgentName, AttrAgentNameDot)
+	span.SetAttributes(
+		attribute.String(AttrGenAISpanKind, SpanKindWorkflow),
+		attribute.String(AttrGenAIOperationName, OperationNameChain),
+	)
+}
+
+// setLLMAttributes sets standard GenAI attributes for managed call_llm spans.
+func setLLMAttributes(span trace.Span) {
+	span.SetAttributes(
+		attribute.String(AttrGenAISpanKind, SpanKindLLM),
+		attribute.String(AttrGenAIOperationName, OperationNameChat),
+		attribute.String(AttrGenAIRequestType, OperationNameChat),
 	)
 }
 

@@ -44,6 +44,16 @@ type VeADKTranslatedExporter struct {
 	trace.SpanExporter
 }
 
+func isMatch(span trace.ReadOnlySpan) bool {
+	if span == nil {
+		return false
+	}
+	if span.InstrumentationScope().Name != ADKInstrumentationName {
+		return true
+	}
+	return span.Name() != SpanCallLLM
+}
+
 // ExportSpans filters and translates spans before exporting them to the underlying exporter.
 func (e *VeADKTranslatedExporter) ExportSpans(ctx context.Context, spans []trace.ReadOnlySpan) error {
 	if e.SpanExporter == nil {
@@ -51,13 +61,18 @@ func (e *VeADKTranslatedExporter) ExportSpans(ctx context.Context, spans []trace
 	}
 
 	translated := make([]trace.ReadOnlySpan, 0, len(spans))
+	registry := GetRegistry()
 
 	for _, s := range spans {
+		if !isMatch(s) {
+			continue
+		}
+
 		ts := &translatedSpan{ReadOnlySpan: s}
 		translated = append(translated, ts)
 
 		if isToolSpanForTraceMapping(s) {
-			registerTraceMappingFromToolCall(s)
+			registerTraceMappingFromToolCall(registry, s)
 		}
 	}
 
@@ -68,7 +83,7 @@ func (e *VeADKTranslatedExporter) ExportSpans(ctx context.Context, spans []trace
 	return e.SpanExporter.ExportSpans(ctx, translated)
 }
 
-func registerTraceMappingFromToolCall(span trace.ReadOnlySpan) {
+func registerTraceMappingFromToolCall(registry *TraceRegistry, span trace.ReadOnlySpan) {
 	if !isToolSpanForTraceMapping(span) {
 		return
 	}
@@ -83,9 +98,8 @@ func registerTraceMappingFromToolCall(span trace.ReadOnlySpan) {
 		return
 	}
 
-	registry := GetRegistry()
-	if veadkParentSC, ok := registry.GetVeadkParentContextByToolCallID(toolCallID); ok {
-		registry.RegisterTraceMapping(adkTraceID, veadkParentSC.TraceID())
+	if veadkParentSC, ownerAdkTraceID, ok := registry.ResolveToolCallParent(adkTraceID, toolCallID); ok {
+		registry.RegisterLinkedTraceMapping(adkTraceID, veadkParentSC.TraceID(), ownerAdkTraceID)
 		log.Debug("Matched tool via ToolCallID, established TraceID mapping",
 			"tool_call_id", toolCallID,
 			"adk_trace_id", adkTraceID.String(),
@@ -280,11 +294,7 @@ func normalizeOperationNameBySpanKind(kind translatedSpanKind, key string, kv at
 }
 
 func (p *translatedSpan) Name() string {
-	name := p.ReadOnlySpan.Name()
-	if classifyTranslatedSpanKind(name) == translatedSpanLLM {
-		return SpanCallLLM
-	}
-	return name
+	return p.ReadOnlySpan.Name()
 }
 
 func (p *translatedSpan) Events() []trace.Event {
@@ -408,6 +418,9 @@ func (p *translatedSpan) reconstructToolOutput(toolName, toolCallID, toolRespons
 
 func (p *translatedSpan) SpanContext() oteltrace.SpanContext {
 	sc := p.ReadOnlySpan.SpanContext()
+	if !shouldRewriteSpanGraph(p.ReadOnlySpan) {
+		return sc
+	}
 	registry := GetRegistry()
 
 	toolCallID := findToolCallID(p.ReadOnlySpan.Attributes())
@@ -433,7 +446,7 @@ func findToolCallID(attrs []attribute.KeyValue) string {
 }
 
 func (p *translatedSpan) tryRemapSpanContextByToolCallID(registry *TraceRegistry, sc oteltrace.SpanContext, toolCallID string) (oteltrace.SpanContext, bool) {
-	if veadkParentSC, ok := registry.GetVeadkParentContextByToolCallID(toolCallID); ok {
+	if veadkParentSC, ok := registry.GetVeadkParentContextByToolCallID(sc.TraceID(), toolCallID); ok {
 		return newSpanContextWithTraceID(sc, veadkParentSC.TraceID()), true
 	}
 	return oteltrace.SpanContext{}, false
@@ -458,35 +471,48 @@ func newSpanContextWithTraceID(sc oteltrace.SpanContext, traceID oteltrace.Trace
 
 func (p *translatedSpan) Parent() oteltrace.SpanContext {
 	parent := p.ReadOnlySpan.Parent()
+	if !shouldRewriteSpanGraph(p.ReadOnlySpan) {
+		return parent
+	}
 	registry := GetRegistry()
+	sc := p.ReadOnlySpan.SpanContext()
 
 	// 1. Check if this is an invoke_agent span - link to our invocation span if available
 	if classifyTranslatedSpanKind(p.ReadOnlySpan.Name()) == translatedSpanAgent {
-		adkTraceID := p.ReadOnlySpan.SpanContext().TraceID()
-		if invocationSC, ok := registry.GetInvocationSpanContext(adkTraceID); ok {
-			return invocationSC
+		if invocationSC, ok := registry.GetInvocationSpanContext(sc.TraceID()); ok {
+			return p.nonSelfParent(invocationSC, parent)
 		}
 	}
 
-	// 2. Check for tool call ID mapping
+	// 2. Tool spans should prefer their precise logical tool_call_id mapping.
 	toolCallID := findToolCallID(p.ReadOnlySpan.Attributes())
-	if remapped, ok := tryParentByToolCallID(registry, toolCallID); ok {
-		return remapped
+	if isTranslatedToolSpan(p.ReadOnlySpan) {
+		if manualParentSC, ok := registry.GetVeadkParentContextByToolCallID(sc.TraceID(), toolCallID); ok {
+			return p.nonSelfParent(manualParentSC, parent)
+		}
 	}
 
-	// 3. Check for trace ID mapping
+	// 3. Raw generate_content spans need a dedicated bridge to the matching
+	// managed call_llm span. Their raw parent is invoke_agent and is not
+	// specific enough once multiple model calls occur in one trace.
+	if isTranslatedGenerateContentSpan(p.ReadOnlySpan) {
+		if llmParentSC, ok := registry.ResolveManagedLLMParent(sc.TraceID(), p.ReadOnlySpan.StartTime(), p.ReadOnlySpan.EndTime()); ok {
+			return p.nonSelfParent(llmParentSC, parent)
+		}
+	}
+
+	// 4. Non-tool spans that happen to carry a tool_call_id can still fall back
+	// to the logical mapping if no direct parent bridge exists.
+	if manualParentSC, ok := registry.GetVeadkParentContextByToolCallID(sc.TraceID(), toolCallID); ok {
+		return p.nonSelfParent(manualParentSC, parent)
+	}
+
+	// 5. Re-parent by trace-id mapping when ADK emitted a separate internal trace.
 	if remapped, ok := tryParentByTraceID(registry, parent); ok {
-		return remapped
+		return p.nonSelfParent(remapped, parent)
 	}
 
 	return parent
-}
-
-func tryParentByToolCallID(registry *TraceRegistry, toolCallID string) (oteltrace.SpanContext, bool) {
-	if manualParentSC, ok := registry.GetVeadkParentContextByToolCallID(toolCallID); ok {
-		return manualParentSC, true
-	}
-	return oteltrace.SpanContext{}, false
 }
 
 func tryParentByTraceID(registry *TraceRegistry, parent oteltrace.SpanContext) (oteltrace.SpanContext, bool) {
@@ -511,6 +537,29 @@ func (p *translatedSpan) InstrumentationScope() instrumentation.Scope {
 
 func (p *translatedSpan) InstrumentationLibrary() instrumentation.Scope {
 	return p.InstrumentationScope()
+}
+
+func (p *translatedSpan) nonSelfParent(candidate, fallback oteltrace.SpanContext) oteltrace.SpanContext {
+	if !candidate.IsValid() {
+		return fallback
+	}
+	sc := p.SpanContext()
+	if sc.IsValid() && candidate.TraceID() == sc.TraceID() && candidate.SpanID() == sc.SpanID() {
+		return fallback
+	}
+	return candidate
+}
+
+func shouldRewriteSpanGraph(span trace.ReadOnlySpan) bool {
+	return span != nil && span.InstrumentationScope().Name == ADKInstrumentationName
+}
+
+func isTranslatedToolSpan(span trace.ReadOnlySpan) bool {
+	return span != nil && strings.HasPrefix(span.Name(), SpanExecuteTool)
+}
+
+func isTranslatedGenerateContentSpan(span trace.ReadOnlySpan) bool {
+	return span != nil && strings.HasPrefix(span.Name(), SpanPrefixGenerateContent)
 }
 
 func getStringAttrFromList(attrs []attribute.KeyValue, key, fallback string) string {

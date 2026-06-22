@@ -4,7 +4,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/genai"
 )
 
 func TestMergeUsageTotals(t *testing.T) {
@@ -28,6 +30,26 @@ func TestMergeUsageTotals(t *testing.T) {
 		assert.Equal(t, int64(0), candidate)
 		assert.Equal(t, int64(0), total)
 	})
+}
+
+func TestLLMUsageAttributes(t *testing.T) {
+	attrs := llmUsageAttributes(&genai.GenerateContentResponseUsageMetadata{
+		PromptTokenCount:        6,
+		CandidatesTokenCount:    1,
+		TotalTokenCount:         0,
+		CachedContentTokenCount: 3,
+	})
+
+	got := map[attribute.Key]int64{}
+	for _, attr := range attrs {
+		got[attr.Key] = attr.Value.AsInt64()
+	}
+
+	assert.Equal(t, int64(6), got[attribute.Key(AttrGenAIUsageInputTokens)])
+	assert.Equal(t, int64(1), got[attribute.Key(AttrGenAIUsageOutputTokens)])
+	assert.Equal(t, int64(7), got[attribute.Key(AttrGenAIUsageTotalTokens)])
+	assert.Equal(t, int64(3), got[attribute.Key(AttrGenAIUsageCacheCreationInputTokens)])
+	assert.Equal(t, int64(3), got[attribute.Key(AttrGenAIUsageCacheReadInputTokens)])
 }
 
 func TestRegisterTraceMappingIfPossible(t *testing.T) {
