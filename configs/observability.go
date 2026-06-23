@@ -15,8 +15,10 @@
 package configs
 
 import (
+	stdlog "log"
 	"os"
 
+	"github.com/volcengine/veadk-go/common"
 	"github.com/volcengine/veadk-go/utils"
 )
 
@@ -40,6 +42,7 @@ const (
 	EnvObservabilityOpenTelemetryTLSEndpoint    = "OBSERVABILITY_OPENTELEMETRY_TLS_ENDPOINT"
 	EnvObservabilityOpenTelemetryTLSServiceName = "OBSERVABILITY_OPENTELEMETRY_TLS_SERVICE_NAME"
 	EnvObservabilityOpenTelemetryTLSRegion      = "OBSERVABILITY_OPENTELEMETRY_TLS_REGION"
+	EnvObservabilityOpenTelemetryTLSProjectName = "OBSERVABILITY_OPENTELEMETRY_TLS_PROJECT_NAME"
 	EnvObservabilityOpenTelemetryTLSTopicID     = "OBSERVABILITY_OPENTELEMETRY_TLS_TOPIC_ID"
 	EnvObservabilityOpenTelemetryTLSAccessKey   = "OBSERVABILITY_OPENTELEMETRY_TLS_ACCESS_KEY"
 	EnvObservabilityOpenTelemetryTLSSecretKey   = "OBSERVABILITY_OPENTELEMETRY_TLS_SECRET_KEY"
@@ -192,20 +195,28 @@ func (c *ObservabilityConfig) MapEnvToConfig() {
 		ot.TLS.Region = v
 	}
 
-	if v := utils.GetEnvWithDefault(EnvObservabilityOpenTelemetryTLSTopicID); v != "" {
+	resolvedTLSTopicID, err := resolveObservabilityTLSTopicIDFromEnv()
+	if err != nil {
+		stdlog.Printf("observability tls topic lookup degraded: %v", err)
+	}
+
+	if v := utils.GetEnvWithDefault(EnvObservabilityOpenTelemetryTLSTopicID, resolvedTLSTopicID); v != "" {
 		if ot.TLS == nil {
 			ot.TLS = &TLSExporterConfig{}
 		}
 		ot.TLS.TopicID = v
+		if os.Getenv(EnvObservabilityOpenTelemetryTLSTopicID) == "" {
+			os.Setenv(EnvObservabilityOpenTelemetryTLSTopicID, v)
+		}
 	}
 
-	if v := utils.GetEnvWithDefault(EnvObservabilityOpenTelemetryTLSAccessKey); v != "" {
+	if v := utils.GetEnvWithDefault(EnvObservabilityOpenTelemetryTLSAccessKey, os.Getenv(common.VOLCENGINE_ACCESS_KEY)); v != "" {
 		if ot.TLS == nil {
 			ot.TLS = &TLSExporterConfig{}
 		}
 		ot.TLS.AccessKey = v
 	}
-	if v := utils.GetEnvWithDefault(EnvObservabilityOpenTelemetryTLSSecretKey); v != "" {
+	if v := utils.GetEnvWithDefault(EnvObservabilityOpenTelemetryTLSSecretKey, os.Getenv(common.VOLCENGINE_SECRET_KEY)); v != "" {
 		if ot.TLS == nil {
 			ot.TLS = &TLSExporterConfig{}
 		}
